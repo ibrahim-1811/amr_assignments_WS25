@@ -1,0 +1,11 @@
+# Common ignores
+__pycache__/
+*.pyc
+*.log
+build/
+devel/
+install/
+.env
+.vscode/
+.idea/
+*.bag

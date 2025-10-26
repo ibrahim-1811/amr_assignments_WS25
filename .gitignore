@@ -9,3 +9,5 @@ install/
 .vscode/
 .idea/
 *.bag
+bag/
+

@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'odom_node = odom.odometry_motion:main',
+            'odom_node2 = odom.odometry_motion:main',
         ],
     },
 )

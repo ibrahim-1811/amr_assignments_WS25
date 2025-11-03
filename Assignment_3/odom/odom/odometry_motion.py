@@ -14,9 +14,9 @@ class OdometryMotion(Node):
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         
         self.goal = {
-            "x":2.0,
-            "y":-3.0,
-            "theta":-2.0
+            "x":4.0,
+            "y":-4.0,
+            "theta":-1.0
         }
 
         self.treshold = 0.05

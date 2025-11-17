@@ -1,140 +1,156 @@
-# YOUR CODE HERE
-
 import rclpy
 from rclpy.node import Node
 
+
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+
 from tf_transformations import euler_from_quaternion
+import tf2_ros 
+from geometry_msgs.msg import PoseStamped
+from tf2_geometry_msgs import do_transform_pose
 
-from math import atan2, sqrt, pi
+from math import sin, cos, isinf, atan2
+import numpy as np
 
-
-def normalize_angle(angle: float) -> float:
-    """
-    Normalize an angle to the range [-pi, pi].
-    """
-    while angle > pi:
-        angle -= 2.0 * pi
-    while angle < -pi:
-        angle += 2.0 * pi
-    return angle
-
-
-class OdometryMotion(Node):
-    """
-    A ROS2 node that drives a robot toward a specified goal pose using odometry feedback.
-    """
+class PotentialField(Node):
 
     def __init__(self):
-        super().__init__('odometry_motion')
+        super().__init__('potential_field')
+        self.subscriber1_ = self.create_subscription(LaserScan, '/scan', self.callback, 10)
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         
-        # Declare and read parameters
-        self.declare_parameter('goal_x', 2.0)
-        self.declare_parameter('goal_y', -3.0)
-        self.declare_parameter('goal_theta', -2.0)
-        self.declare_parameter('threshold', 0.05)
-        self.declare_parameter('linear_velocity', 1.0)
-        self.declare_parameter('angular_velocity', 0.5)
-        self.declare_parameter('publish_rate', 10.0)
+        self.goal = {
+            "x":4.0,
+            "y":10.0,
+            "theta":-1.0
+        }
 
-        self.goal_x = self.get_parameter('goal_x').value
-        self.goal_y = self.get_parameter('goal_y').value
-        self.goal_theta = self.get_parameter('goal_theta').value
-        self.threshold = self.get_parameter('threshold').value
-        self.linear_velocity = self.get_parameter('linear_velocity').value
-        self.angular_velocity = self.get_parameter('angular_velocity').value
-        rate = self.get_parameter('publish_rate').value
+        self.psGoal = PoseStamped()
+        self.psGoal.header.frame_id = 'odom'
+        self.psGoal.pose.position.x = self.goal["x"]
+        self.psGoal.pose.position.y = self.goal["y"]
+        self.psGoal.pose.orientation.w = cos(self.goal["theta"] * 0.5)
+        self.psGoal.pose.orientation.z = sin(self.goal["theta"] * 0.5)
 
-        self.current_pose = None  
+        self.ka = 1
+        self.kr = 0.5
 
-        # Subscribers & Publishers
-        self.subscription = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            10
-        )
-        self.publisher = self.create_publisher(
-            Twist,
-            '/cmd_vel',
-            10
-        )
+        self.maxVelocity = 3
 
-        # Timer for control loop
-        timer_period = 1.0 / rate
-        self.timer = self.create_timer(timer_period, self.control_loop)
+        self.repulsiveThreshold = 20 
+        self.errorThreshold = 0.1
+
+        self.angularVelocity = 0.8
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.timeWD = self.get_clock().now()
+        self.goalDistanceWD = 0
         
-        self.get_logger().info('OdometryMotion node initialized')
+    def getAttractive(self, g_b):
+        return self.ka*g_b/np.linalg.norm(g_b)
 
-    def odom_callback(self, msg: Odometry) -> None:
-        """
-        Callback to update the current robot pose from odometry.
-        """
-        self.current_pose = msg.pose.pose
+    def getRepulsive(self, obstacles):
+        vr = 0
 
-    def control_loop(self) -> None:
-        """
-        Periodic control loop: compute and publish velocity commands.
-        """
-        if self.current_pose is None:
+        for o in obstacles:
+            norm = np.linalg.norm(o)
+            if norm < self.repulsiveThreshold:
+                vr -= self.kr * (1/norm - 1/self.repulsiveThreshold )*(1/norm**2)*o/norm
         
-            return
+        return vr
+    
+    def polar2cart(self, polar):
+        cartesian_data = list()
+        for ro,theta in polar:
+            if not isinf(ro):
+                x = ro * cos(theta)
+                y = ro * sin(theta)
+                cartesian_data.append(np.array([x, y]))
+    
+        return np.array(cartesian_data)
+    
+    def isRobotStuck(self, goalDistance):
 
-        # Extract pose and orientation
-        x = self.current_pose.position.x
-        y = self.current_pose.position.y
-        quat = self.current_pose.orientation
-        _, _, yaw = euler_from_quaternion([quat.x, quat.y, quat.z, quat.w])
-
+        if abs(goalDistance - self.goalDistanceWD) > 1:
+            self.timeWD = self.get_clock().now()
+            self.goalDistanceWD = goalDistance
         
-        dx = self.goal_x - x
-        dy = self.goal_y - y
-        distance_error = sqrt(dx**2 + dy**2)
+        isStuck = self.get_clock().now().seconds_nanoseconds()[0] - self.timeWD.seconds_nanoseconds()[0] > 5.
 
-        angle_to_goal = atan2(dy, dx)
-        heading_error = normalize_angle(angle_to_goal - yaw)
-        orientation_error = normalize_angle(self.goal_theta - yaw)
+        if isStuck: 
+            self.timeWD = self.get_clock().now()
 
-        cmd = Twist()
+        return isStuck
+        
+    def goToGoal(self, msg, position)->Twist:
+        command = Twist()
 
-        # Decision logic
-        if distance_error < self.threshold:
-            # At goal position: adjust orientation only
-            if abs(orientation_error) < self.threshold:
-                cmd.linear.x = 0.0
-                cmd.angular.z = 0.0
-                self.get_logger().info('Goal reached')
-            else:
-                cmd.linear.x = 0.0
-                cmd.angular.z = self.angular_velocity * (1 if orientation_error > 0 else -1)
-        else:
+        angles = np.arange(msg.angle_min, msg.angle_max, msg.angle_increment)
+        polar = zip(msg.ranges, angles)
+
+        cartesian = self.polar2cart(polar) # all the obstacles
+
+        transformed_point = np.array([position.x, position.y])
+        force = None
+        
+        if self.isRobotStuck(np.linalg.norm(transformed_point)):
+            force = np.random.random(2)*5 
+        else:        
+            force = self.getAttractive(transformed_point) + self.getRepulsive(cartesian)
+
+        if np.linalg.norm(force) > self.maxVelocity:
+            force = force/np.linalg.norm(force) * self.maxVelocity # Upper bound the maximum velocity 
+
+        command.linear.x = force[0]
+        command.linear.y = force[1]
+
+        command.angular.z = np.clip(atan2(command.linear.y, command.linear.x), -self.angularVelocity , self.angularVelocity)
+
+        return command
+    
+    def alignToAngle(self, angle):
+        command = Twist()
+        command.linear.x = 0.
+        command.linear.y = 0.
+        command.angular.z = self.angularVelocity if angle> 0 else -self.angularVelocity
+        return command
+    
+    def callback(self, msg: LaserScan):
+        
+        command = Twist()
+
+        if self.tf_buffer.can_transform("base_link", "odom", rclpy.time.Time().to_msg()):
             
-            if abs(heading_error) > self.threshold:
-                cmd.linear.x = 0.0
-                cmd.angular.z = self.angular_velocity * (1 if heading_error > 0 else -1)
+            transform_stamped = self.tf_buffer.lookup_transform("base_link", "odom", rclpy.time.Time().to_msg())
+            transformed_pose = do_transform_pose(self.psGoal.pose, transform_stamped)
+            eulerAngle = euler_from_quaternion([transformed_pose.orientation.x,transformed_pose.orientation.y,transformed_pose.orientation.z,transformed_pose.orientation.w])[2]
+
+            positionError = (transformed_pose.position.x**2 + transformed_pose.position.y**2)**0.5
+
+            if positionError > self.errorThreshold:
+                command = self.goToGoal(msg, transformed_pose.position)
+
+            elif abs(eulerAngle) > self.errorThreshold:
+                command = self.alignToAngle(eulerAngle)
             else:
-                cmd.linear.x = self.linear_velocity
-                cmd.angular.z = 0.0
+                command.linear.x = 0.; command.linear.y = 0.; command.angular.z = 0.
 
-        # Publish command
-        self.publisher.publish(cmd)
-
-    def destroy_node(self) -> None:
-        self.get_logger().info('Shutting down OdometryMotion node')
-        super().destroy_node()
+        self.publisher_.publish(command)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = OdometryMotion()
-    rclpy.spin(node)
-    node.destroy_node()
+
+    odm = PotentialField()
+
+    rclpy.spin(odm)
+
+    odm.destroy_node()
     rclpy.shutdown()
 
 
 if __name__ == '__main__':
     main()
-    
-    
-# raise NotImplementedError()
